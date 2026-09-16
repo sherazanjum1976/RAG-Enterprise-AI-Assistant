@@ -11,6 +11,10 @@ FAISS_INDEX_PATH = "faiss_index"
 METADATA_PATH = "metadata.json"
 GROQ_MODEL = "openai/gpt-oss-120b"
 TOP_K = 5
+# Cosine similarity cutoff (index is built with normalized embeddings + inner product,
+# so scores range roughly 0-1). Chunks scoring below this are treated as irrelevant
+# and excluded from context and sources.
+SIMILARITY_THRESHOLD = 0.35
 
 st.set_page_config(page_title="Enterprise Document QA", layout="wide")
 
@@ -54,7 +58,13 @@ def get_groq_client():
     return Groq(api_key=api_key)
 
 
-def retrieve_chunks(query, embed_model, index, metadata, top_k=TOP_K):
+def retrieve_chunks(query, embed_model, index, metadata, top_k=TOP_K, threshold=SIMILARITY_THRESHOLD):
+    """Return only chunks that are actually relevant to the query.
+
+    Retrieves the top_k nearest chunks by cosine similarity, then drops any
+    chunk scoring below `threshold`, so unrelated documents never make it
+    into the context or the sources list.
+    """
     if index.ntotal != len(metadata):
         st.warning("FAISS index and metadata.json record counts do not match. Results may be unreliable.")
 
@@ -71,8 +81,14 @@ def retrieve_chunks(query, embed_model, index, metadata, top_k=TOP_K):
     for score, idx in zip(scores[0], indices[0]):
         if idx == -1 or idx >= len(metadata):
             continue
+        score = float(score)
+        if score < threshold:
+            continue  # irrelevant chunk — exclude from context and sources
         record = metadata[idx]
-        results.append({**record, "score": float(score)})
+        results.append({**record, "score": score})
+
+    # Highest relevance first
+    results.sort(key=lambda r: r["score"], reverse=True)
     return results
 
 
@@ -126,14 +142,31 @@ def main():
     st.sidebar.write(f"Embedding model: {EMBEDDING_MODEL_NAME}")
     st.sidebar.write(f"LLM model: {GROQ_MODEL}")
 
+    st.sidebar.header("Relevance Filter")
+    similarity_threshold = st.sidebar.slider(
+        "Minimum relevance score",
+        min_value=0.0,
+        max_value=1.0,
+        value=SIMILARITY_THRESHOLD,
+        step=0.05,
+        help="Chunks scoring below this cosine-similarity value are treated as "
+        "irrelevant and excluded from the answer and sources. Raise it for stricter "
+        "matching, lower it if relevant documents are being missed.",
+    )
+
     question = st.text_input("Ask a question about your documents:")
 
     if st.button("Get Answer") and question.strip():
         with st.spinner("Retrieving relevant context..."):
-            chunks = retrieve_chunks(question, embed_model, index, metadata)
+            chunks = retrieve_chunks(
+                question, embed_model, index, metadata, threshold=similarity_threshold
+            )
 
         if not chunks:
-            st.warning("No relevant content found in the index.")
+            st.warning(
+                "No sufficiently relevant content found in the index for this question "
+                f"(nothing scored above {similarity_threshold:.2f})."
+            )
             return
 
         context = build_context(chunks)
